@@ -4,60 +4,84 @@
 
 ## Overview
 
-Life Manager is the intelligence hub of the Open-Closed system. It aggregates data from multiple sources, runs the planning algorithm, stores analytics, and exports a simplified daily plan for Life Launcher to display.
+Life Manager is the intelligence hub of the Open-Closed system. It aggregates data from multiple sources, runs the planning algorithm with smart time-blocking, stores analytics, and exports a daily plan for Life Launcher to display.
 
-**Role**: Data aggregator, analytics engine, planning brain
+**Role**: Data aggregator, analytics engine, planning brain, time-blocker
 
 **Not responsible for**: Mobile UI, direct user task completion (that's Life Launcher's job)
+
+## Key Responsibilities
+
+1. **Energy Input** - User sets energy level (0-10) at start of day
+2. **Smart Time-Blocking** - Read user's calendar, slot tasks into gaps
+3. **Plan Export** - Write plan to "Life Manager - Today's Plan" calendar
+4. **Completion Tracking** - Read status updates from calendar events
+5. **Analytics** - Track completions, skips, snoozes, domain balance
 
 ## Task Encoding Convention
 
 For both clients to understand tasks identically:
 
 ```
-Task Title Format:
+Event Title Format:
 [!!!] Call Mom (15m)
  │     │        │
  │     │        └── Duration in minutes
  │     └── Task title
- └── Priority: [!!!]=must-do, [!!]=should-do, [!]=nice-to-have (default: should-do)
+ └── Priority: [!!!]=must-do, [!!]=should-do, [!]=nice-to-have
 
-Task List = Domain:
-- "Health" list
-- "Admin" list  
-- "Relationships" list
-- "University" list
-- "Creative" list
+Event Description Format:
+Domain: Relationships
+Task ID: 42
+Category: must-do
+Status: pending|completed|skipped|snoozed
+CompletedAt: 2026-02-09T09:12:00Z (if completed)
+SkippedAt: 2026-02-09T09:12:00Z (if skipped)
+SnoozedAt: 2026-02-09T09:12:00Z (if snoozed)
+SnoozedTo: 2026-02-10 (if snoozed)
 ```
 
-## Widget States
+## Smart Time-Blocking Algorithm
 
-| State | When | Display |
-|-------|------|---------|
-| NextTask | Tasks available | Task title, duration, domain |
-| EnergyCheckIn | No tasks for current energy | Energy slider (0-10) |
-| BalanceWarning | Domain neglected (0 tasks/week) | Domain name, warning |
-| AllCaughtUp | No tasks, energy logged | Celebration message |
-| Loading | Fetching from Google | Loading indicator |
-| Error | API failure | Error + cached state |
+Life Manager reads the user's primary calendar and slots tasks into gaps between meetings:
+
+```
+User's calendar:                    Life Manager exports:
+─────────────────────────────────────────────────────────────
+09:00-10:00  Team standup           
+                                    10:00-10:15  [!!!] Call Mom (15m)
+                                    10:15-10:45  [!!] Pay bills (30m)
+                                    10:50-10:55  Buffer
+11:00-12:00  Client call            
+                                    12:00-12:30  [!] Go for walk (30m)
+12:30-13:30  Lunch with Sarah       
+                                    13:30-14:00  [!!] Review docs (30m)
+```
+
+**Rules:**
+- Minimum gap: 10 minutes (shorter gaps ignored)
+- Buffer before meetings: 5 minutes
+- All-day events: Ignored (don't block time)
+- Tasks that don't fit: Scheduled at end of day
 
 ## Planner Algorithm
 
-The algorithm is deterministic — given the same inputs, it produces the same output. This ensures Life Launcher (reading from Google Calendar) sees the same plan that Life Manager computed.
+The algorithm is deterministic — given the same inputs, it produces the same output.
 
 **Inputs:**
-- Tasks from all sources (Google Tasks, Todoist, etc.)
-- Completions in last 7 days (from SQLite)
-- Energy level (0-10, from latest check-in)
-- Activity data (from Google Fit, planned)
+- Tasks from all sources (Google Tasks, etc.)
+- User's calendar events (for time-blocking)
+- Completions/skips/snoozes in last 7 days (from SQLite)
+- Energy level (0-10, from web app input)
 - Current date and time
 
 **Algorithm:**
-1. Aggregate tasks from all sources
-2. Filter by energy-based duration cap (low energy = short tasks only)
-3. Score each task: `priority_weight + domain_neglect_bonus + overdue_bonus`
-4. Select top N tasks (N depends on energy level)
-5. Export to Google Calendar as "Today's Plan"
+1. Read user's primary calendar, find gaps
+2. Aggregate tasks from all sources
+3. Filter by energy-based duration cap
+4. Score each task: `priority_weight + domain_neglect_bonus + overdue_bonus`
+5. Slot top N tasks into calendar gaps
+6. Export to "Life Manager - Today's Plan" calendar with Status: pending
 
 **Energy Configuration:**
 | Energy | Tasks | Duration Cap |
@@ -66,119 +90,170 @@ The algorithm is deterministic — given the same inputs, it produces the same o
 | 4-6    | 3-5   | No cap       |
 | 7-10   | 5-6   | No cap       |
 
-**Output**: List of tasks exported to Google Calendar for Life Launcher to display
-
 ## Data Flow
 
-### Import Cycle (Pull from Sources)
+### Plan Generation Flow
 ```
-1. Scheduled job triggers (every 5-15 min)
-2. Fetch from all sources:
-   - Google Tasks API (tasks by list/domain)
-   - Google Calendar API (events, completions)
-   - Todoist API (planned)
-   - Google Fit API (planned)
-3. Parse and normalize data
-4. Store in SQLite with source metadata
-5. Update sync timestamps
-```
-
-### Planning Cycle (Generate Daily Plan)
-```
-1. Aggregate tasks from all sources
-2. Get latest energy level from database
-3. Get completion history (last 7 days)
-4. Run planner algorithm:
-   - Filter by energy-based duration cap
-   - Score by priority + domain balance + overdue
-   - Select top N tasks
-5. Export to Google Calendar as "Today's Plan"
-6. Life Launcher reads from Google Calendar
+1. User opens Life Manager, sets energy level
+   ↓
+2. Fetch user's primary calendar (meetings)
+   ↓
+3. Find gaps between meetings
+   ↓
+4. Fetch tasks from Google Tasks
+   ↓
+5. Score and select tasks
+   ↓
+6. Slot tasks into gaps (smart time-blocking)
+   ↓
+7. Export to "Life Manager - Today's Plan" calendar
+   ↓
+8. Life Launcher reads plan from calendar
 ```
 
-### Analytics Cycle (Store History)
+### Completion Sync Flow
 ```
-1. Pull completed tasks from Google
-2. Store completions in SQLite
-3. Calculate streaks per domain
-4. Update domain balance metrics
-5. Check guardrail conditions
-6. Generate weekly summaries
+1. Life Launcher updates event status in calendar
+   ↓
+2. Life Manager reads status on next sync:
+   - Status: completed → task_completions table
+   - Status: skipped → task_skips table
+   - Status: snoozed → reschedule for SnoozedTo date
+   ↓
+3. Update domain balance calculations
+   ↓
+4. Recalculate for next plan generation
+```
+
+### Snooze Handling
+```
+1. Life Launcher sets Status: snoozed, SnoozedTo: 2026-02-10
+   ↓
+2. Life Manager reads snooze on next sync
+   ↓
+3. Task rescheduled for snoozed date
+   ↓
+4. Appears in next day's plan generation
+```
+
+## New Services (To Be Implemented)
+
+### plan-exporter.ts
+```typescript
+export class PlanExporter {
+  // Get or create "Life Manager - Today's Plan" calendar
+  async getOrCreatePlanCalendar(userId: number): Promise<string>
+  
+  // Clear today's events before exporting new plan
+  async clearTodaysPlanEvents(calendarId: string, date: string): Promise<void>
+  
+  // Create calendar event for a planned task
+  async createPlanEvent(calendarId: string, item: TodayPlanItem, date: string): Promise<void>
+  
+  // Encode task title: [!!!] Title (15m)
+  encodeTaskTitle(task: Task): string
+  
+  // Encode description with metadata
+  encodeTaskDescription(item: TodayPlanItem): string
+}
+```
+
+### completion-reader.ts
+```typescript
+export class CompletionReader {
+  // Read completion/skip/snooze status from plan calendar
+  async getCompletions(userId: number, date: string): Promise<TaskCompletion[]>
+  
+  // Parse status from event description
+  parseStatus(description: string): 'pending' | 'completed' | 'skipped' | 'snoozed'
+  
+  // Parse task ID from description
+  parseTaskId(description: string): number | null
+  
+  // Parse timestamps
+  parseTimestamp(description: string, status: string): Date | null
+}
 ```
 
 ## File Structure
 
 ```
 src/
-├── server/              # Backend (Node.js + tRPC)
+├── server/
 │   ├── db/
-│   │   ├── schema.ts    # Drizzle schema (single source of truth)
-│   │   ├── index.ts     # DB connection + migration runner
-│   │   └── seed.ts      # Default data seeder
-│   ├── routers/         # tRPC API endpoints (one per domain)
-│   │   ├── task.ts      # Task CRUD + sync
-│   │   ├── domain.ts    # Domain management
-│   │   ├── planner.ts   # Planning algorithm endpoint
-│   │   ├── sync.ts      # Manual sync triggers
-│   │   └── stats.ts     # Analytics endpoints
-│   ├── services/        # Business logic (pure functions)
-│   │   ├── planner.ts              # Planning algorithm
-│   │   ├── sync-engine.ts          # Multi-source sync orchestration
-│   │   ├── google-tasks-client.ts  # Google Tasks API
-│   │   ├── google-calendar-client.ts # Google Calendar API
-│   │   ├── oauth-manager.ts        # OAuth token management
-│   │   ├── balance.ts              # Domain balance calculations
-│   │   ├── streaks.ts              # Streak tracking
-│   │   └── guardrails.ts           # Safety checks
-│   ├── trpc.ts          # tRPC context + router initialization
-│   └── index.ts         # Express server + tRPC adapter
-├── client/              # Frontend (React + Vite)
-│   ├── components/      # React components
+│   │   ├── schema.ts         # Drizzle schema
+│   │   ├── index.ts          # DB connection
+│   │   └── seed.ts           # Default data
+│   ├── routers/
+│   │   ├── task.ts           # Task CRUD
+│   │   ├── domain.ts         # Domain management
+│   │   ├── planner.ts        # Plan generation + export
+│   │   ├── sync.ts           # Manual sync triggers
+│   │   └── stats.ts          # Analytics
+│   ├── services/
+│   │   ├── planner.ts        # Planning algorithm
+│   │   ├── plan-exporter.ts  # NEW: Export to calendar
+│   │   ├── completion-reader.ts # NEW: Read status
+│   │   ├── sync-engine.ts    # Multi-source sync
+│   │   ├── google-tasks-client.ts
+│   │   ├── google-calendar-client.ts
+│   │   ├── oauth-manager.ts
+│   │   ├── balance.ts
+│   │   ├── streaks.ts
+│   │   └── guardrails.ts
+│   ├── trpc.ts
+│   └── index.ts
+├── client/
+│   ├── components/
 │   │   ├── TaskList.tsx
 │   │   ├── DomainList.tsx
 │   │   ├── TodayPlan.tsx
-│   │   ├── BalanceChart.tsx
+│   │   ├── EnergySlider.tsx  # Energy input
+│   │   ├── BalanceChart.tsx  # Domain balance radar
 │   │   ├── StreakDisplay.tsx
-│   │   ├── GuardrailBanner.tsx
-│   │   └── GoogleSyncSettings.tsx
-│   ├── hooks/           # Custom React hooks
+│   │   └── GuardrailBanner.tsx
+│   ├── hooks/
 │   │   └── useBackgroundSync.ts
 │   ├── lib/
-│   │   └── trpc.ts      # tRPC client setup
-│   ├── App.tsx          # Main app component + navigation
-│   └── main.tsx         # React entry point
+│   │   └── trpc.ts
+│   ├── App.tsx
+│   └── main.tsx
 └── shared/
-    ├── types.ts         # Shared Zod schemas + TypeScript types
+    ├── types.ts
     └── types/
-        └── sync.ts      # Sync-specific types
+        └── sync.ts
 ```
 
-## Dependencies
+## Database Schema Updates
 
-- **@trpc/server** & **@trpc/client**: Type-safe API layer
-- **@tanstack/react-query**: Data fetching and caching (used by tRPC)
-- **drizzle-orm**: Type-safe SQL query builder
-- **better-sqlite3**: SQLite driver
-- **googleapis**: Google Calendar and Tasks API integration
-- **p-retry**: Retry logic for sync operations
-- **fast-check**: Property-based testing library
-- **zod**: Runtime validation and type inference
-- **express**: HTTP server
-- **vite**: Frontend build tool
-- **react**: UI framework
-- **tailwind**: CSS framework
+```typescript
+// New table: task_skips
+export const taskSkips = sqliteTable('task_skips', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  taskId: integer('task_id').notNull().references(() => tasks.id),
+  domainId: integer('domain_id').notNull().references(() => domains.id),
+  skippedAt: text('skipped_at').notNull(),
+  skippedDate: text('skipped_date').notNull(),
+});
+
+// New table: plan_exports
+export const planExports = sqliteTable('plan_exports', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  date: text('date').notNull(),
+  energyLevel: integer('energy_level').notNull(),
+  taskCount: integer('task_count').notNull(),
+  exportedAt: text('exported_at').notNull(),
+});
+```
 
 ## Security
 
 - OAuth tokens stored in environment variables (`.env`)
-- Database contains only aggregated analytics (no sensitive task content from other users)
 - Each user authenticates with their own Google account
 - No central user database (privacy-first design)
 - All data stays in user's Google account + local SQLite
 
 ## Deployment
-
-Life Manager can be deployed in several ways:
 
 **Local Development:**
 ```bash
@@ -191,50 +266,10 @@ npm run build
 npm start
 ```
 
-**Environment Variables Required:**
+**Environment Variables:**
 - `GOOGLE_CLIENT_ID`: OAuth client ID
 - `GOOGLE_CLIENT_SECRET`: OAuth client secret
 - `GOOGLE_REDIRECT_URI`: OAuth callback URL
-
-See `.env.example` for template.
-
-## Future Integrations
-
-### Todoist
-```typescript
-// services/todoist-client.ts
-export class TodoistClient {
-  async fetchTasks(): Promise<TodoistTask[]>
-  async completeTask(id: string): Promise<void>
-}
-```
-
-### Google Fit
-```typescript
-// services/google-fit-client.ts
-export class GoogleFitClient {
-  async getStepCount(date: Date): Promise<number>
-  async getWorkouts(start: Date, end: Date): Promise<Workout[]>
-}
-```
-
-### Custom Fitness Plans
-```typescript
-// db/schema.ts
-export const fitnessPlans = sqliteTable('fitness_plans', {
-  dayOfWeek: integer('day_of_week'), // 0-6
-  exerciseType: text('exercise_type'),
-  targetDuration: integer('target_duration'),
-  adaptiveIntensity: integer('adaptive_intensity'),
-});
-```
-
-All new integrations follow the same pattern:
-1. Create client service
-2. Add sync metadata table
-3. Extend sync engine
-4. Update planner algorithm
-5. Export to Google Calendar for launcher
 
 ## Testing
 
@@ -244,14 +279,8 @@ npm run test:ui             # Visual test UI
 npm test -- --watch         # Watch mode
 ```
 
-Test coverage includes:
-- Unit tests for services (pure functions)
-- Property-based tests (fast-check)
-- Integration tests for sync engine
-- Router tests for tRPC endpoints
-
 ## Related Documentation
 
-- [Overall System Architecture](../ARCHITECTURE.md) - How Life Manager and Life Launcher work together
-- [Google Tasks Integration](./GOOGLE-TASKS-INTEGRATION.md) - Google API setup
-- [Widget Design](./WIDGET-DESIGN.md) - UI/UX considerations
+- [Overall System Architecture](../ARCHITECTURE.md)
+- [Alignment Spec](../.kiro/specs/open-closed-alignment/)
+- [Google Tasks Integration](./GOOGLE-TASKS-INTEGRATION.md)

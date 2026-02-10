@@ -1,10 +1,11 @@
 import { drizzle } from 'drizzle-orm/better-sqlite3';
 import { eq, and, lte } from 'drizzle-orm';
 import * as schema from '../db/schema.js';
-import { tasks, taskSyncMetadata, syncLog, syncQueue } from '../db/schema.js';
+import { tasks, taskSyncMetadata, syncLog, syncQueue, taskCompletions, taskSkips } from '../db/schema.js';
 import { OAuthManager } from './oauth-manager.js';
 import { GoogleCalendarClient, CalendarEvent } from './google-calendar-client.js';
 import { GoogleTasksClient, GoogleTask } from './google-tasks-client.js';
+import { CompletionReader } from './completion-reader.js';
 import pRetry, { AbortError } from 'p-retry';
 
 /**
@@ -72,6 +73,7 @@ interface TaskData {
 export class SyncEngine {
   private calendarClient: GoogleCalendarClient;
   private tasksClient: GoogleTasksClient;
+  private completionReader: CompletionReader;
   private isProcessingQueuedOperation = false; // Track if we're in a retry
 
   /**
@@ -103,6 +105,7 @@ export class SyncEngine {
   ) {
     this.calendarClient = new GoogleCalendarClient();
     this.tasksClient = new GoogleTasksClient();
+    this.completionReader = new CompletionReader(this.calendarClient);
     
     // Allow overriding retry options (useful for testing)
     if (retryOptions) {
@@ -147,6 +150,9 @@ export class SyncEngine {
     
     // Import Google Tasks
     await this.importGoogleTasks(oauth2Client, result);
+
+    // Import task completions from plan calendar
+    await this.importTaskCompletions(oauth2Client, result);
 
     return result;
   }
@@ -221,6 +227,105 @@ export class SyncEngine {
     } catch (error) {
       result.errors.push(this.createSyncError('import', 'task', 'all', error));
       await this.logSync('import', 'task', null, 'failure', {
+        error: this.getErrorMessage(error),
+      });
+    }
+  }
+
+  /**
+   * Import task completions from plan calendar
+   * 
+   * Reads completion/skip status from "Life Manager - Today's Plan" calendar
+   * Life Launcher updates events with Status: completed|skipped
+   */
+  private async importTaskCompletions(oauth2Client: any, result: ImportResult): Promise<void> {
+    try {
+      const today = new Date().toISOString().split('T')[0];
+      console.log('[SyncEngine] Fetching task completions from plan calendar...');
+      
+      const completions = await this.withRetry(
+        () => this.completionReader.getCompletions(oauth2Client, today),
+        'importTaskCompletions - getCompletions'
+      );
+      
+      console.log(`[SyncEngine] Got ${completions.length} task completions`);
+      
+      let completedCount = 0;
+      let skippedCount = 0;
+      
+      for (const completion of completions) {
+        try {
+          // Get task to find domainId
+          const task = await this.getTask(completion.taskId);
+          if (!task) {
+            console.warn(`[SyncEngine] Task ${completion.taskId} not found, skipping completion`);
+            continue;
+          }
+          
+          const completedDate = completion.timestamp.toISOString().split('T')[0];
+          
+          if (completion.status === 'completed') {
+            // Check if completion already exists (idempotency)
+            const existing = await this.db
+              .select()
+              .from(taskCompletions)
+              .where(
+                and(
+                  eq(taskCompletions.taskId, completion.taskId),
+                  eq(taskCompletions.completedDate, completedDate),
+                  eq(taskCompletions.source, 'launcher')
+                )
+              )
+              .limit(1);
+            
+            if (existing.length === 0) {
+              await this.db.insert(taskCompletions).values({
+                taskId: completion.taskId,
+                domainId: task.domainId,
+                completedAt: completion.timestamp.toISOString(),
+                completedDate,
+                source: 'launcher',
+              });
+              completedCount++;
+            }
+          } else if (completion.status === 'skipped') {
+            // Check if skip already exists (idempotency)
+            const existing = await this.db
+              .select()
+              .from(taskSkips)
+              .where(
+                and(
+                  eq(taskSkips.taskId, completion.taskId),
+                  eq(taskSkips.skippedDate, completedDate)
+                )
+              )
+              .limit(1);
+            
+            if (existing.length === 0) {
+              await this.db.insert(taskSkips).values({
+                taskId: completion.taskId,
+                domainId: task.domainId,
+                skippedAt: completion.timestamp.toISOString(),
+                skippedDate: completedDate,
+              });
+              skippedCount++;
+            }
+          }
+        } catch (error) {
+          console.error(`[SyncEngine] Failed to store completion for task ${completion.taskId}:`, error instanceof Error ? error.message : error);
+          result.errors.push(this.createSyncError('import', 'task', completion.taskId.toString(), error));
+        }
+      }
+      
+      await this.logSync('import', 'completion', null, 'success', {
+        total: completions.length,
+        completed: completedCount,
+        skipped: skippedCount,
+      });
+    } catch (error) {
+      console.error('[SyncEngine] Failed to import task completions:', error instanceof Error ? error.message : error);
+      result.errors.push(this.createSyncError('import', 'task', 'completions', error));
+      await this.logSync('import', 'completion', null, 'failure', {
         error: this.getErrorMessage(error),
       });
     }

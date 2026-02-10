@@ -18,6 +18,7 @@ import type { GoogleTask } from '../google-tasks-client.js';
 vi.mock('../google-calendar-client.js');
 vi.mock('../google-tasks-client.js');
 vi.mock('../oauth-manager.js');
+vi.mock('../completion-reader.js');
 
 describe('SyncEngine - Import Operations', () => {
   let db: ReturnType<typeof drizzle<typeof schema>>;
@@ -26,6 +27,7 @@ describe('SyncEngine - Import Operations', () => {
   let mockOAuthManager: any;
   let mockCalendarClient: any;
   let mockTasksClient: any;
+  let mockCompletionReader: any;
 
   beforeEach(() => {
     // Create in-memory database
@@ -56,6 +58,23 @@ describe('SyncEngine - Import Operations', () => {
         rrule TEXT,
         created_at TEXT NOT NULL,
         updated_at TEXT NOT NULL
+      );
+
+      CREATE TABLE IF NOT EXISTS task_completions (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        domain_id INTEGER NOT NULL,
+        completed_at TEXT NOT NULL,
+        completed_date TEXT NOT NULL,
+        source TEXT NOT NULL DEFAULT 'web'
+      );
+
+      CREATE TABLE IF NOT EXISTS task_skips (
+        id INTEGER PRIMARY KEY AUTOINCREMENT,
+        task_id INTEGER NOT NULL,
+        domain_id INTEGER NOT NULL,
+        skipped_at TEXT NOT NULL,
+        skipped_date TEXT NOT NULL
       );
 
       CREATE TABLE IF NOT EXISTS task_sync_metadata (
@@ -108,6 +127,10 @@ describe('SyncEngine - Import Operations', () => {
       completeTask: vi.fn().mockResolvedValue(undefined),
     };
 
+    mockCompletionReader = {
+      getCompletions: vi.fn().mockResolvedValue([]),
+    };
+
     // Create sync engine with mocked dependencies and fast retry options for testing
     syncEngine = new SyncEngine(db, mockOAuthManager as any, 1, 1, {
       retries: 2, // Fewer retries for faster tests
@@ -116,6 +139,7 @@ describe('SyncEngine - Import Operations', () => {
     });
     (syncEngine as any).calendarClient = mockCalendarClient;
     (syncEngine as any).tasksClient = mockTasksClient;
+    (syncEngine as any).completionReader = mockCompletionReader;
   });
 
   afterEach(() => {
@@ -405,6 +429,178 @@ describe('SyncEngine - Import Operations', () => {
       expect(result.calendarEventsImported).toBe(0);
       expect(result.tasksImported).toBe(1);
       expect(result.errors.some(e => e.error === 'Calendar API error')).toBe(true);
+    }, 10000); // Increase timeout for retry logic
+  });
+
+  // ==========================================================================
+  // importTaskCompletions tests (Task 1.4)
+  // ==========================================================================
+
+  describe('importTaskCompletions', () => {
+    beforeEach(async () => {
+      // Create test tasks for completion tracking
+      const now = new Date().toISOString();
+      await db.insert(schema.tasks).values([
+        {
+          id: 1,
+          title: 'Task 1',
+          domainId: 1,
+          priority: 'must-do',
+          estimatedMinutes: 30,
+          status: 'todo',
+          createdAt: now,
+          updatedAt: now,
+        },
+        {
+          id: 2,
+          title: 'Task 2',
+          domainId: 1,
+          priority: 'should-do',
+          estimatedMinutes: 15,
+          status: 'todo',
+          createdAt: now,
+          updatedAt: now,
+        },
+      ]);
+    });
+
+    it('should import completed tasks from plan calendar', async () => {
+      const completions = [
+        {
+          taskId: 1,
+          status: 'completed' as const,
+          timestamp: new Date('2026-02-09T10:30:00Z'),
+          actualDuration: 25,
+        },
+      ];
+
+      mockCalendarClient.getTodayEvents.mockResolvedValue([]);
+      mockTasksClient.getTodayTasks.mockResolvedValue([]);
+      mockCompletionReader.getCompletions.mockResolvedValue(completions);
+
+      const result = await syncEngine.importFromGoogle();
+
+      expect(result.errors).toHaveLength(0);
+
+      // Verify completion was stored
+      const storedCompletions = await db.select().from(schema.taskCompletions);
+      expect(storedCompletions).toHaveLength(1);
+      expect(storedCompletions[0].taskId).toBe(1);
+      expect(storedCompletions[0].domainId).toBe(1);
+      expect(storedCompletions[0].source).toBe('launcher');
+      expect(storedCompletions[0].completedDate).toBe('2026-02-09');
+    });
+
+    it('should import skipped tasks from plan calendar', async () => {
+      const completions = [
+        {
+          taskId: 2,
+          status: 'skipped' as const,
+          timestamp: new Date('2026-02-09T11:15:00Z'),
+        },
+      ];
+
+      mockCalendarClient.getTodayEvents.mockResolvedValue([]);
+      mockTasksClient.getTodayTasks.mockResolvedValue([]);
+      mockCompletionReader.getCompletions.mockResolvedValue(completions);
+
+      const result = await syncEngine.importFromGoogle();
+
+      expect(result.errors).toHaveLength(0);
+
+      // Verify skip was stored
+      const storedSkips = await db.select().from(schema.taskSkips);
+      expect(storedSkips).toHaveLength(1);
+      expect(storedSkips[0].taskId).toBe(2);
+      expect(storedSkips[0].domainId).toBe(1);
+      expect(storedSkips[0].skippedDate).toBe('2026-02-09');
+    });
+
+    it('should import both completions and skips in one sync', async () => {
+      const completions = [
+        {
+          taskId: 1,
+          status: 'completed' as const,
+          timestamp: new Date('2026-02-09T10:30:00Z'),
+        },
+        {
+          taskId: 2,
+          status: 'skipped' as const,
+          timestamp: new Date('2026-02-09T11:15:00Z'),
+        },
+      ];
+
+      mockCalendarClient.getTodayEvents.mockResolvedValue([]);
+      mockTasksClient.getTodayTasks.mockResolvedValue([]);
+      mockCompletionReader.getCompletions.mockResolvedValue(completions);
+
+      const result = await syncEngine.importFromGoogle();
+
+      expect(result.errors).toHaveLength(0);
+
+      // Verify both were stored
+      const storedCompletions = await db.select().from(schema.taskCompletions);
+      expect(storedCompletions).toHaveLength(1);
+      expect(storedCompletions[0].taskId).toBe(1);
+
+      const storedSkips = await db.select().from(schema.taskSkips);
+      expect(storedSkips).toHaveLength(1);
+      expect(storedSkips[0].taskId).toBe(2);
+    });
+
+    it('should be idempotent - importing same completion twice does not duplicate', async () => {
+      const completions = [
+        {
+          taskId: 1,
+          status: 'completed' as const,
+          timestamp: new Date('2026-02-09T10:30:00Z'),
+        },
+      ];
+
+      mockCalendarClient.getTodayEvents.mockResolvedValue([]);
+      mockTasksClient.getTodayTasks.mockResolvedValue([]);
+      mockCompletionReader.getCompletions.mockResolvedValue(completions);
+
+      // Import twice
+      await syncEngine.importFromGoogle();
+      await syncEngine.importFromGoogle();
+
+      // Should still have only one completion
+      const storedCompletions = await db.select().from(schema.taskCompletions);
+      expect(storedCompletions).toHaveLength(1);
+    });
+
+    it('should skip completions for non-existent tasks', async () => {
+      const completions = [
+        {
+          taskId: 999, // Non-existent task
+          status: 'completed' as const,
+          timestamp: new Date('2026-02-09T10:30:00Z'),
+        },
+      ];
+
+      mockCalendarClient.getTodayEvents.mockResolvedValue([]);
+      mockTasksClient.getTodayTasks.mockResolvedValue([]);
+      mockCompletionReader.getCompletions.mockResolvedValue(completions);
+
+      const result = await syncEngine.importFromGoogle();
+
+      // Should not store completion for non-existent task
+      const storedCompletions = await db.select().from(schema.taskCompletions);
+      expect(storedCompletions).toHaveLength(0);
+    });
+
+    it('should handle completion reader errors gracefully', async () => {
+      mockCalendarClient.getTodayEvents.mockResolvedValue([]);
+      mockTasksClient.getTodayTasks.mockResolvedValue([]);
+      mockCompletionReader.getCompletions.mockRejectedValue(new Error('Calendar not found'));
+
+      const result = await syncEngine.importFromGoogle();
+
+      // Should have error but not crash
+      expect(result.errors.some(e => e.error.includes('Calendar not found'))).toBe(true);
+      expect(result.calendarEventsImported).toBe(0);
+      expect(result.tasksImported).toBe(0);
     }, 10000); // Increase timeout for retry logic
   });
 });

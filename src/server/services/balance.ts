@@ -88,6 +88,10 @@ function countCompletionsByDomain(
  * Returns completion counts per domain over the specified time window,
  * with neglect flags for domains with zero completions.
  * 
+ * NOTE: This function includes ALL task completions regardless of source
+ * (web or launcher), so launcher completions are automatically included
+ * in domain balance calculations.
+ * 
  * @param input - Domains, task completions, and date range
  * @returns Array of domain balance objects, one per domain
  */

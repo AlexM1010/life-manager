@@ -33,6 +33,16 @@ export const taskCompletions = sqliteTable('task_completions', {
   domainId: integer('domain_id').notNull().references(() => domains.id),
   completedAt: text('completed_at').notNull(), // ISO datetime
   completedDate: text('completed_date').notNull(), // ISO date (for grouping)
+  source: text('source', { enum: ['web', 'launcher'] }).notNull().default('web'), // Where completion came from
+});
+
+// Task skips (log of every skip event from launcher)
+export const taskSkips = sqliteTable('task_skips', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  taskId: integer('task_id').notNull().references(() => tasks.id),
+  domainId: integer('domain_id').notNull().references(() => domains.id),
+  skippedAt: text('skipped_at').notNull(), // ISO datetime
+  skippedDate: text('skipped_date').notNull(), // ISO date (for grouping)
 });
 
 // Snooze log
@@ -73,6 +83,22 @@ export const todayPlanItems = sqliteTable('today_plan_items', {
   completed: integer('completed', { mode: 'boolean' }).notNull().default(false),
   snoozed: integer('snoozed', { mode: 'boolean' }).notNull().default(false),
 });
+
+// Plan exports (track when plans are exported to Google Calendar)
+export const planExports = sqliteTable('plan_exports', {
+  id: integer('id').primaryKey({ autoIncrement: true }),
+  userId: integer('user_id').notNull(),
+  planId: integer('plan_id').notNull().references(() => todayPlans.id),
+  calendarId: text('calendar_id').notNull(), // Google Calendar ID
+  exportedAt: text('exported_at').notNull(), // ISO datetime
+  taskCount: integer('task_count').notNull(), // Number of tasks exported
+  status: text('status', { enum: ['success', 'partial', 'failed'] }).notNull(),
+  error: text('error'), // Error message if failed
+}, (table) => ({
+  userIdx: index('idx_plan_exports_user').on(table.userId),
+  planIdx: index('idx_plan_exports_plan').on(table.planId),
+  exportedAtIdx: index('idx_plan_exports_exported_at').on(table.exportedAt),
+}));
 
 // OAuth tokens (for Google Calendar/Tasks sync)
 export const oauthTokens = sqliteTable('oauth_tokens', {

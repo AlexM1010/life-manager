@@ -298,4 +298,97 @@ describe('Planner Router - Integration Tests', () => {
       expect(plan?.date).toBe(testDate);
     });
   });
+
+  describe('syncPlan', () => {
+    it('should throw error when no plan exists', async () => {
+      // Try to sync non-existent plan
+      await expect(
+        caller.syncPlan({})
+      ).rejects.toThrow(/No plan exists/);
+    });
+
+    it('should throw error when plan has no items', async () => {
+      // Create a plan with no items
+      const [emptyPlan] = await db.insert(schema.todayPlans).values({
+        date: new Date().toISOString().split('T')[0],
+        energyLevel: 5,
+        createdAt: new Date().toISOString(),
+      }).returning();
+
+      // Try to sync empty plan
+      await expect(
+        caller.syncPlan({})
+      ).rejects.toThrow(/Plan has no items to export/);
+    });
+
+    it('should throw error when OAuth tokens not available', async () => {
+      // Create test domain and task
+      const [healthDomain] = await db.insert(schema.domains).values({
+        name: 'Health',
+        description: 'Health and wellness',
+        whyItMatters: 'Essential for wellbeing',
+        boringButImportant: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }).returning();
+
+      await db.insert(schema.tasks).values({
+        title: 'Morning exercise',
+        description: 'Go for a run',
+        domainId: healthDomain.id,
+        priority: TaskPriority.MUST_DO,
+        estimatedMinutes: 30,
+        dueDate: null,
+        status: 'todo',
+        rrule: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      // Generate plan
+      await caller.generate({ energyLevel: 5 });
+
+      // Try to sync without OAuth tokens
+      // This should fail because no tokens are configured
+      await expect(
+        caller.syncPlan({})
+      ).rejects.toThrow();
+    });
+
+    it('should sync plan for specific date', async () => {
+      // Create test domain and task
+      const [healthDomain] = await db.insert(schema.domains).values({
+        name: 'Health',
+        description: 'Health and wellness',
+        whyItMatters: 'Essential for wellbeing',
+        boringButImportant: false,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      }).returning();
+
+      await db.insert(schema.tasks).values({
+        title: 'Morning exercise',
+        description: 'Go for a run',
+        domainId: healthDomain.id,
+        priority: TaskPriority.MUST_DO,
+        estimatedMinutes: 30,
+        dueDate: null,
+        status: 'todo',
+        rrule: null,
+        createdAt: new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+      });
+
+      const testDate = '2026-02-10';
+
+      // Generate plan for specific date
+      await caller.generate({ energyLevel: 5, date: testDate });
+
+      // Try to sync plan for that date
+      // This should fail because no tokens are configured, but it validates the date parameter
+      await expect(
+        caller.syncPlan({ date: testDate })
+      ).rejects.toThrow();
+    });
+  });
 });

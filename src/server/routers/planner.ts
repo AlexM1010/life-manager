@@ -13,6 +13,26 @@ import { TRPCError } from '@trpc/server';
 import { generatePlan } from '../services/planner.js';
 import type { Task, Domain } from '../services/planner.js';
 import { z } from 'zod';
+import { PlanExporter } from '../services/plan-exporter.js';
+import { GoogleCalendarClient } from '../services/google-calendar-client.js';
+import { OAuthManager, OAuthConfig } from '../services/oauth-manager.js';
+
+/**
+ * Get OAuth config from environment variables
+ */
+function getOAuthConfig(): OAuthConfig {
+  const clientId = process.env.GOOGLE_CLIENT_ID;
+  const clientSecret = process.env.GOOGLE_CLIENT_SECRET;
+  const redirectUri = process.env.GOOGLE_REDIRECT_URI || 'http://localhost:5173/auth/google/callback';
+
+  if (!clientId || !clientSecret) {
+    throw new Error(
+      'Missing Google OAuth credentials. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env'
+    );
+  }
+
+  return { clientId, clientSecret, redirectUri };
+}
 
 /**
  * Planner Router
@@ -195,13 +215,33 @@ export const plannerRouter = router({
         };
       });
 
-      return {
+      const result = {
         id: savedPlan.id,
         date: savedPlan.date,
         energyLevel: savedPlan.energyLevel,
         items: itemsWithTasks,
         createdAt: savedPlan.createdAt,
       };
+
+      // Export plan to Google Calendar (if OAuth tokens available)
+      try {
+        // TODO: Get actual userId from context when auth is implemented
+        const userId = 1; // Hardcoded for single-user app
+        
+        const oauthManager = new OAuthManager(ctx.db, getOAuthConfig());
+        const oauth2Client = await oauthManager.getOAuth2Client(userId);
+        
+        const calendarClient = new GoogleCalendarClient();
+        const planExporter = new PlanExporter(calendarClient, ctx.db);
+        
+        await planExporter.exportPlan(plan, oauth2Client);
+      } catch (error) {
+        // Log error but don't fail the plan generation
+        // Plan export is optional - user may not have connected Google account
+        console.error('Failed to export plan to Google Calendar:', error);
+      }
+
+      return result;
     }),
 
   /**
@@ -420,6 +460,114 @@ export const plannerRouter = router({
         items: itemsWithTasks,
         createdAt: plan.createdAt,
       };
+    }),
+
+  /**
+   * Sync plan to Google Calendar
+   * 
+   * Manually triggers export of today's plan to Google Calendar.
+   * Useful for re-syncing after connection issues or manual plan edits.
+   * 
+   * Requirements: 1.1, 1.2, 1.3
+   */
+  syncPlan: publicProcedure
+    .input(getTodayPlanSchema)
+    .mutation(async ({ ctx, input }) => {
+      const targetDate = input.date || new Date().toISOString().split('T')[0];
+
+      // Fetch the existing plan
+      const [plan] = await ctx.db
+        .select()
+        .from(todayPlans)
+        .where(eq(todayPlans.date, targetDate))
+        .limit(1);
+
+      if (!plan) {
+        throw new TRPCError({
+          code: 'NOT_FOUND',
+          message: `No plan exists for ${targetDate}. Generate a plan first.`,
+        });
+      }
+
+      // Fetch plan items
+      const planItems = await ctx.db
+        .select()
+        .from(todayPlanItems)
+        .where(eq(todayPlanItems.planId, plan.id));
+
+      if (planItems.length === 0) {
+        throw new TRPCError({
+          code: 'BAD_REQUEST',
+          message: 'Plan has no items to export',
+        });
+      }
+
+      // Build task map
+      const taskMap = new Map<number, typeof tasks.$inferSelect>();
+      for (const item of planItems) {
+        const [task] = await ctx.db
+          .select()
+          .from(tasks)
+          .where(eq(tasks.id, item.taskId))
+          .limit(1);
+        if (task) taskMap.set(task.id, task);
+      }
+
+      // Build plan object for export
+      const planToExport = {
+        date: plan.date,
+        energyLevel: plan.energyLevel,
+        items: planItems.map(item => {
+          const task = taskMap.get(item.taskId);
+          if (!task) {
+            throw new TRPCError({
+              code: 'INTERNAL_SERVER_ERROR',
+              message: `Task ${item.taskId} not found`,
+            });
+          }
+          return {
+            taskId: item.taskId,
+            category: item.category,
+            task: {
+              id: task.id,
+              title: task.title,
+              description: task.description || '',
+              domainId: task.domainId,
+              priority: task.priority,
+              estimatedMinutes: task.estimatedMinutes,
+              dueDate: task.dueDate,
+              status: task.status,
+              createdAt: task.createdAt,
+            },
+          };
+        }),
+      };
+
+      // Export to Google Calendar
+      try {
+        // TODO: Get actual userId from context when auth is implemented
+        const userId = 1; // Hardcoded for single-user app
+        
+        const oauthManager = new OAuthManager(ctx.db, getOAuthConfig());
+        const oauth2Client = await oauthManager.getOAuth2Client(userId);
+        
+        const calendarClient = new GoogleCalendarClient();
+        const planExporter = new PlanExporter(calendarClient, ctx.db);
+        
+        await planExporter.exportPlan(planToExport, oauth2Client);
+        
+        return {
+          success: true,
+          message: `Plan for ${targetDate} exported to Google Calendar`,
+          itemsExported: planItems.length,
+        };
+      } catch (error) {
+        console.error('Failed to sync plan to Google Calendar:', error);
+        throw new TRPCError({
+          code: 'INTERNAL_SERVER_ERROR',
+          message: error instanceof Error ? error.message : 'Failed to sync plan to Google Calendar',
+        });
+      }
     }),
 
   /**

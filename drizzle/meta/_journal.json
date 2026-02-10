@@ -15,6 +15,13 @@
       "when": 1770406281638,
       "tag": "0001_outstanding_mockingbird",
       "breakpoints": true
+    },
+    {
+      "idx": 2,
+      "version": "6",
+      "when": 1770647659681,
+      "tag": "0002_brown_ozymandias",
+      "breakpoints": true
     }
   ]
 }
